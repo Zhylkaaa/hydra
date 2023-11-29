@@ -14,10 +14,9 @@
 
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import logging
-from multiprocessing import context
 from pathlib import Path
-from typing import Any, Dict, Union, List, Sequence
-from itertools import repeat
+from typing import Any, Dict, Union, List, Sequence, Optional
+import copy
 from enum import Enum
 
 import cloudpickle
@@ -26,6 +25,7 @@ from hydra.core.hydra_config import HydraConfig
 from hydra.core.singleton import Singleton
 from hydra.core.utils import (
     JobReturn,
+    JobStatus,
     configure_log,
     filter_overrides,
     run_job,
@@ -33,8 +33,9 @@ from hydra.core.utils import (
 )
 from hydra.plugins.experiment_sequence import ExperimentSequence
 from hydra.types import HydraContext, TaskFunction
-from omegaconf import DictConfig, open_dict
+from omegaconf import OmegaConf, DictConfig, open_dict
 import multiprocessing as mp
+import multiprocessing.connection
 
 from .multiprocessing_launcher import MultiprocessingLauncher
 
@@ -77,9 +78,12 @@ def execute_job(
     return ret
 
 
-def _proxy_fn_call(*args):
+def _proxy_fn_call(lock: mp.Lock(), queue: mp.Queue, fn, *args, **kwargs):
     args = [cloudpickle.loads(obj) for obj in args]
-    return cloudpickle.dumps(args[0](*args[1:]))
+    kwargs = {k: cloudpickle.loads(v) for k, v in kwargs.items()}
+    serialized_result = cloudpickle.dumps(fn(*args, **kwargs))
+    with lock:
+        queue.put((mp.current_process().pid, serialized_result))
 
 
 def process_multiprocessing_cfg(mp_cfg: Dict[str, Any]) -> None:
@@ -93,12 +97,58 @@ def process_multiprocessing_cfg(mp_cfg: Dict[str, Any]) -> None:
                 pass
 
 
-def wait(async_result_iter, condition, return_when=WaitingStrategy.ALL_COMPLETED):
-    waiting_strategy = all if return_when is WaitingStrategy.ALL_COMPLETED else any
-    with condition:
-        condition.wait_for(lambda: waiting_strategy([res.ready() for res in async_result_iter]))
-        finished = [res for res in async_result_iter if res.ready()]
-    return finished
+def wait_for_results(running_processes, job_lock, result_queue, return_when=WaitingStrategy.ALL_COMPLETED):
+    if not running_processes:
+        return [], [], []
+    done_waiting = False
+    total_processes = len(running_processes)
+    finished_processes = []
+    results = {}
+
+    while not done_waiting:
+        mp.connection.wait([p.sentinel for p in running_processes])
+        with job_lock:
+            finished_processes.extend([p for p in running_processes if not p.is_alive()])
+            results.update({pid: serialized_result
+                            for pid, serialized_result in iter(result_queue.get_nowait, None)})
+
+            running_processes = [p for p in running_processes if p.is_alive()]
+            if return_when is WaitingStrategy.FIRST_COMPLETED or len(finished_processes) == total_processes:
+                done_waiting = True
+
+    return [results.get(p.pid) for p in finished_processes], finished_processes, running_processes
+
+
+def process_results(
+        results: List[Optional[JobReturn]],
+        overrides_ids: Sequence[Sequence[str]],
+        runs: List[Optional[JobReturn]],
+        job_overrides: Union[Sequence[Sequence[str]], ExperimentSequence],
+        hydra_context: HydraContext,
+        config: DictConfig):
+
+    for result, (overrides, idx) in zip(results, overrides_ids):
+        # we could only get False value if None was returned from waiting function.
+        # which means that process finished without returning, and most likely signals system kill (OOM probably)
+        if not result:
+            result = JobReturn()
+            task_cfg = hydra_context.config_loader.load_sweep_config(
+                config, list(overrides)
+            )
+            result.cfg = task_cfg
+            hydra_cfg = copy.deepcopy(HydraConfig.instance().cfg)
+            assert isinstance(hydra_cfg, DictConfig)
+            result.hydra_cfg = hydra_cfg
+            overrides = OmegaConf.to_container(config.hydra.overrides.task)
+            assert isinstance(overrides, list)
+            result.overrides = overrides
+            result.status = JobStatus.FAILED
+            result.return_value = RuntimeError('Worker Killed: Worker process exited unexpectedly. '
+                                               'May be caused by system OOM kill')
+
+        if isinstance(job_overrides, ExperimentSequence):
+            job_overrides.update_sequence((overrides, result))
+        runs[idx] = result
 
 
 def launch(
@@ -120,63 +170,66 @@ def launch(
     sweep_dir = Path(str(launcher.config.hydra.sweep.dir))
     sweep_dir.mkdir(parents=True, exist_ok=True)
 
-    # ProcessPoolExecutor's backend is hard-coded to loky since the threading
-    # backend is incompatible with Hydra
     singleton_state = Singleton.get_state()
-    batch_size = v if (v := launcher.mp_config['processes']) else mp.cpu_count()
+    batch_size = v if (v := launcher.mp_config['n_jobs']) else mp.cpu_count()
 
     runs = [None for _ in range(len(job_overrides))]
     log.info(
-        "NestablePool({}) is launching {} jobs".format(
+        "MultiprocessingLauncher({}) is launching {} jobs".format(
             ",".join([f"{k}={v}" for k, v in launcher.mp_config.items()]),
             'generator of' if isinstance(job_overrides, ExperimentSequence) else len(job_overrides),
         )
     )
-    running_tasks = {}
 
-    def notify_complete(_):
-        with launcher.condition:
-            launcher.condition.notify()
+    job_lock = mp.Lock()
+    result_queue = mp.Queue()
+
+    running_tasks = {}
 
     for idx, override in enumerate(job_overrides):
         log.info("\t#{} : {}".format(idx, " ".join(filter_overrides(override))))
-        running_tasks[launcher.executor.apply_async(
-            _proxy_fn_call,
-            [cloudpickle.dumps(obj)
-            for obj in (execute_job,
-             initial_job_idx + idx,
-             override,
-             launcher.hydra_context,
-             launcher.config,
-             launcher.task_function,
-             singleton_state)],
-             callback=notify_complete,
-             error_callback=notify_complete
-        )] = (override, idx)
+
+        job_process = mp.Process(
+            target=_proxy_fn_call,
+            args=(
+                job_lock,
+                result_queue,
+                execute_job,
+                *[cloudpickle.dumps(obj) for obj in (
+                    initial_job_idx + idx,
+                    override,
+                    launcher.hydra_context,
+                    launcher.config,
+                    launcher.task_function,
+                    singleton_state
+                )]
+            )
+        )
+        job_process.start()
+        running_tasks[job_process] = (override, idx)
 
         if len(running_tasks) == batch_size:
-            finished = wait(running_tasks, condition=launcher.condition, return_when=WaitingStrategy.FIRST_COMPLETED)
-            overrides = [running_tasks[f] for f in finished]
-            results = [cloudpickle.loads(f.get()) for f in finished]
-            running_tasks = {task: running_tasks[task] for task in running_tasks if task not in finished}
+            results, finished, running = wait_for_results(running_tasks,
+                                                          job_lock,
+                                                          result_queue,
+                                                          return_when=WaitingStrategy.FIRST_COMPLETED)
+            finished_overrides_ids = [running_tasks[p] for p in finished]
+            running_tasks = {p: running_tasks[p] for p in running}
 
-            for (_, idx), res in zip(overrides, results):
-                runs[idx] = res
-            if isinstance(job_overrides, ExperimentSequence):
-                for (override, _), res in zip(overrides, results):
-                    job_overrides.update_sequence((override, res))
-    
-    finished = wait(running_tasks, condition=launcher.condition, return_when=WaitingStrategy.ALL_COMPLETED)
-    overrides = [running_tasks[f] for f in finished]
-    results = [cloudpickle.loads(f.get()) for f in finished]
+            process_results(results,
+                            finished_overrides_ids,
+                            runs,
+                            job_overrides,
+                            launcher.hydra_context,
+                            launcher.config)
 
-    for (_, idx), res in zip(overrides, results):
-        runs[idx] = res
-    if isinstance(job_overrides, ExperimentSequence):
-        for (override, _), res in zip(overrides, results):
-                job_overrides.update_sequence((override, res))
-    
-    #launcher.executor.close()
+    results, finished, _ = wait_for_results(running_tasks,
+                                            job_lock,
+                                            result_queue,
+                                            return_when=WaitingStrategy.ALL_COMPLETED)
+    finished_overrides_ids = [running_tasks[p] for p in finished]
+    process_results(results, finished_overrides_ids, runs, job_overrides, launcher.hydra_context, launcher.config)
+
     assert isinstance(runs, List)
     for run in runs:
         assert isinstance(run, JobReturn)
