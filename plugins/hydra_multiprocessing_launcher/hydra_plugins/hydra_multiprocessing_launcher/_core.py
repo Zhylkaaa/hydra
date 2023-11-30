@@ -78,7 +78,7 @@ def execute_job(
     return ret
 
 
-def _proxy_fn_call(lock: mp.Lock(), queue: mp.Queue, fn, *args, **kwargs):
+def _proxy_fn_call(lock: mp.Lock, queue: mp.Queue, fn, *args, **kwargs):
     args = [cloudpickle.loads(obj) for obj in args]
     kwargs = {k: cloudpickle.loads(v) for k, v in kwargs.items()}
     serialized_result = cloudpickle.dumps(fn(*args, **kwargs))
@@ -109,8 +109,9 @@ def wait_for_results(running_processes, job_lock, result_queue, return_when=Wait
         mp.connection.wait([p.sentinel for p in running_processes])
         with job_lock:
             finished_processes.extend([p for p in running_processes if not p.is_alive()])
+            result_queue.put(None)
             results.update({pid: serialized_result
-                            for pid, serialized_result in iter(result_queue.get_nowait, None)})
+                            for pid, serialized_result in iter(result_queue.get, None)})
 
             running_processes = [p for p in running_processes if p.is_alive()]
             if return_when is WaitingStrategy.FIRST_COMPLETED or len(finished_processes) == total_processes:
@@ -145,6 +146,8 @@ def process_results(
             result.status = JobStatus.FAILED
             result.return_value = RuntimeError('Worker Killed: Worker process exited unexpectedly. '
                                                'May be caused by system OOM kill')
+        else:
+            result = cloudpickle.loads(result)
 
         if isinstance(job_overrides, ExperimentSequence):
             job_overrides.update_sequence((overrides, result))
