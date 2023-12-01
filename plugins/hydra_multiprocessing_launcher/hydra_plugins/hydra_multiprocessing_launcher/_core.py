@@ -16,7 +16,6 @@
 import logging
 from pathlib import Path
 from typing import Any, Dict, Union, List, Sequence, Optional
-import copy
 from enum import Enum
 
 import cloudpickle
@@ -84,6 +83,7 @@ def _proxy_fn_call(lock: mp.Lock, queue: mp.Queue, fn, *args, **kwargs):
     serialized_result = cloudpickle.dumps(fn(*args, **kwargs))
     with lock:
         queue.put((mp.current_process().pid, serialized_result))
+        exit(0)
 
 
 def process_multiprocessing_cfg(mp_cfg: Dict[str, Any]) -> None:
@@ -106,17 +106,24 @@ def wait_for_results(running_processes, job_lock, result_queue, return_when=Wait
     results = {}
 
     while not done_waiting:
+        assert running_processes
         mp.connection.wait([p.sentinel for p in running_processes])
         with job_lock:
-            finished_processes.extend([p for p in running_processes if not p.is_alive()])
+            finished_processes.extend([p for p in running_processes if p.exitcode is not None])
             result_queue.put(None)
             results.update({pid: serialized_result
                             for pid, serialized_result in iter(result_queue.get, None)})
 
-            running_processes = [p for p in running_processes if p.is_alive()]
-            if (return_when is WaitingStrategy.FIRST_COMPLETED) and len(finished_processes) > 0 or \
+            running_processes = [p for p in running_processes if p not in finished_processes]
+            if (return_when is WaitingStrategy.FIRST_COMPLETED and len(finished_processes) > 0) or \
                     len(finished_processes) == total_processes:
                 done_waiting = True
+
+    # safeguard just in case process didn't manage to finish before we collected the result
+    if any(p.pid in results for p in running_processes):
+        for p in running_processes:
+            if p.pid in results:
+                result_queue.put((p.pid, results[p.pid]))
 
     return [results.get(p.pid) for p in finished_processes], finished_processes, running_processes
 
@@ -138,9 +145,6 @@ def process_results(
                 config, list(overrides)
             )
             result.cfg = task_cfg
-            hydra_cfg = copy.deepcopy(HydraConfig.instance().cfg)
-            assert isinstance(hydra_cfg, DictConfig)
-            result.hydra_cfg = hydra_cfg
             overrides = OmegaConf.to_container(config.hydra.overrides.task)
             assert isinstance(overrides, list)
             result.overrides = overrides
