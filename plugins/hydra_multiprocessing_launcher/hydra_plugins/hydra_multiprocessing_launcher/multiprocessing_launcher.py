@@ -15,12 +15,14 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import logging
 from typing import Any, Optional, Sequence
+import multiprocessing as mp
 
 from hydra.core.utils import JobReturn
 from hydra.plugins.launcher import Launcher
 from hydra.plugins.experiment_sequence import ExperimentSequence
 from hydra.types import HydraContext, TaskFunction
 from omegaconf import DictConfig
+
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ class MultiprocessingLauncher(Launcher):
         self.config = config
         self.task_function = task_function
         self.hydra_context = hydra_context
+        mp.set_start_method('spawn', force=True)
 
     def launch(
         self, job_overrides: Sequence[Sequence[str]], initial_job_idx: int

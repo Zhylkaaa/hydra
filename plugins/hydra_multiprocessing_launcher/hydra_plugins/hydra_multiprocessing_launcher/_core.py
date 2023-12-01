@@ -114,7 +114,8 @@ def wait_for_results(running_processes, job_lock, result_queue, return_when=Wait
                             for pid, serialized_result in iter(result_queue.get, None)})
 
             running_processes = [p for p in running_processes if p.is_alive()]
-            if return_when is WaitingStrategy.FIRST_COMPLETED or len(finished_processes) == total_processes:
+            if (return_when is WaitingStrategy.FIRST_COMPLETED) and len(finished_processes) > 0 or \
+                    len(finished_processes) == total_processes:
                 done_waiting = True
 
     return [results.get(p.pid) for p in finished_processes], finished_processes, running_processes

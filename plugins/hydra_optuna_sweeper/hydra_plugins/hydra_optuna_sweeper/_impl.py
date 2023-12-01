@@ -260,7 +260,7 @@ class OptunaExperimentSequence(ExperimentSequence):
         # raise if too many failures
         if self.fault_tolerance < 0:
             log.error(
-                f"Failed more then allowed {int(self.num_experiments * self.max_failure_rate)} time(s) "
+                f"Failed more than allowed {int(self.num_experiments * self.max_failure_rate)} time(s) "
                 f"out of total {self.num_experiments} experiments with max_failure_rate={self.max_failure_rate}."
             )
             ret.return_value  # delegate raising to JobReturn, with actual traceback
