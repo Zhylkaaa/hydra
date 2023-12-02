@@ -47,7 +47,7 @@ class MultiprocessingLauncher(Launcher):
         self.config = config
         self.task_function = task_function
         self.hydra_context = hydra_context
-        mp.set_start_method('spawn', force=True)
+        mp.set_start_method(self.mp_config["start_method"], force=True)
 
     def launch(
         self, job_overrides: Sequence[Sequence[str]], initial_job_idx: int

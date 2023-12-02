@@ -26,6 +26,9 @@ class MultiprocessingLauncherConf:
     # maximum number of concurrently running jobs. if None, all CPUs are used
     n_jobs: Optional[int] = None
 
+    # multiprocessing process context (either fork or spawn)
+    start_method: str = "spawn"
+
 
 ConfigStore.instance().store(
     group="hydra/launcher",
