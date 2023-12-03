@@ -87,8 +87,7 @@ def test_example_app(hydra_sweep_runner: TSweepRunner, tmpdir: Any) -> None:
 @mark.parametrize(
     "overrides",
     [
-        "hydra.launcher.processes=1",
-        "hydra.launcher.maxtasksperchild=1"
+        "hydra.launcher.n_jobs=1",
     ],
 )
 def test_example_app_launcher_overrides(

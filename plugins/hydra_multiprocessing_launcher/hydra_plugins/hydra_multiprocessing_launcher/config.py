@@ -24,10 +24,10 @@ class MultiprocessingLauncherConf:
     _target_: str = "hydra_plugins.hydra_multiprocessing_launcher.multiprocessing_launcher.MultiprocessingLauncher"
 
     # maximum number of concurrently running jobs. if None, all CPUs are used
-    processes: Optional[int] = None
+    n_jobs: Optional[int] = None
 
-    # the number of tasks a worker process can complete before it will exit and be replaced with a fresh worker process
-    maxtasksperchild: Optional[int] = None
+    # multiprocessing process context (either fork or spawn)
+    start_method: str = "spawn"
 
 
 ConfigStore.instance().store(
